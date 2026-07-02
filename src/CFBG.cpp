@@ -328,6 +328,18 @@ void CFBG::EnforceBGTeamConsistency(Player* player)
     {
         if (IsPlayerFake(player))
             ClearFakePlayer(player);
+
+        // A foreign template can outlive its writer on a non-faked native
+        // (e.g. a charm undone after an unfake). Repair it unless a legitimate
+        // writer owns it: GM-on holds FACTION_FRIENDLY; an active MOD_FACTION
+        // aura restores natives correctly on removal.
+        if (!player->IsGameMaster() && !player->HasAuraType(SPELL_AURA_MOD_FACTION))
+        {
+            ChrRacesEntry const* raceEntry = sChrRacesStore.LookupEntry(player->getRace(true));
+            if (raceEntry && player->GetFaction() != raceEntry->FactionID)
+                SetFactionForRace(player, player->getRace(true), player->GetTeamId(true));
+        }
+
         return;
     }
 
@@ -537,6 +549,13 @@ void CFBG::ClearFakePlayer(Player* player)
     if (!IsPlayerFake(player))
         return;
 
+    // Unwind any charm ON the player while the fake record still exists:
+    // Unit::RemoveCharmedBy blindly restores the faction snapshotted at charm
+    // time (the fake one), which the restore below then overwrites. A charm
+    // ending after the unfake would re-plant the fake template (#166).
+    if (player->IsCharmed())
+        player->RemoveCharmAuras();
+
     player->setRace(_fakePlayerStore[player].RealRace);
     player->SetDisplayId(_fakePlayerStore[player].RealMorph);
     player->SetNativeDisplayId(_fakePlayerStore[player].RealNativeMorph);
@@ -546,6 +565,13 @@ void CFBG::ClearFakePlayer(Player* player)
     player->GetReputationMgr().ApplyForceReaction(FACTION_FROSTWOLF_CLAN, REP_FRIENDLY, false);
     player->GetReputationMgr().ApplyForceReaction(FACTION_STORMPIKE_GUARD, REP_FRIENDLY, false);
 
+    _fakePlayerStore.erase(player);
+}
+
+// Erase-only: no race/morph/faction/m_team restore. Used at wartime WG logout,
+// where Player::RemoveFromWorld still erases PlayersInWar keyed on the fake team.
+void CFBG::DropFakePlayerRecord(Player* player)
+{
     _fakePlayerStore.erase(player);
 }
 
