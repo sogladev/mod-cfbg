@@ -6,6 +6,7 @@
 #include "CFBG.h"
 #include "Battlefield.h"
 #include "BattlefieldMgr.h"
+#include "Chat.h"
 #include "Group.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
@@ -35,7 +36,7 @@ public:
 
     void OnBattlegroundAddPlayer(Battleground* bg, Player* player) override
     {
-        sCFBG->FitPlayerInTeam(player, true, bg);
+        sCFBG->FitPlayerInTeam(player, bg);
 
         if (sCFBG->IsEnableResetCooldowns())
             player->RemoveArenaSpellCooldowns(true);
@@ -54,8 +55,6 @@ public:
     {
         if (!sCFBG->IsEnableSystem() || bg->isArena())
             return;
-
-        sCFBG->FitPlayerInTeam(player, false, bg);
 
         if (sCFBG->IsPlayerFake(player))
             sCFBG->ClearFakePlayer(player);
@@ -118,7 +117,7 @@ public:
             return;
 
         if (player->GetTeamId(true) != player->GetBgTeamId())
-            sCFBG->FitPlayerInTeam(player, player->GetBattleground() && !player->GetBattleground()->isArena(), player->GetBattleground());
+            sCFBG->FitPlayerInTeam(player, player->GetBattleground());
     }
 
     void OnPlayerLogout(Player* player) override
@@ -183,7 +182,12 @@ public:
                 return true;
 
             if (group->isRaidGroup() || group->GetMembersCount() > sCFBG->GetMaxPlayersCountInGroup())
+            {
+                // The client shows only a generic "Join as a group failed.";
+                // name the actual limit so the leader knows what to change.
+                ChatHandler(player->GetSession()).PSendSysMessage("Battleground groups are limited to {} players.", sCFBG->GetMaxPlayersCountInGroup());
                 err = ERR_BATTLEGROUND_JOIN_FAILED;
+            }
 
             return false;
         }
@@ -191,15 +195,12 @@ public:
         return true;
     }
 
-    void OnPlayerBeforeUpdate(Player* player, uint32 diff) override
+    void OnPlayerBeforeUpdate(Player* player, uint32 /*diff*/) override
     {
-        if (timeCheck <= diff)
-        {
+        // The flag is set once per BG add (or login into a BG) and cleared
+        // after service, so serving it on the next tick self-rate-limits.
+        if (sCFBG->HasPendingForget(player))
             sCFBG->UpdateForget(player);
-            timeCheck = 10000;
-        }
-        else
-            timeCheck -= diff;
     }
 
     void OnPlayerBeforeSendChatMessage(Player* player, uint32& type, uint32& lang, std::string& /*msg*/) override
@@ -218,6 +219,11 @@ public:
 
         // skip addon and system message
         if (type == CHAT_MSG_ADDON || type == CHAT_MSG_SYSTEM)
+            return;
+
+        // keep proximity chat in the native language so enemies get
+        // the normal cross-faction scramble instead of readable text
+        if (type == CHAT_MSG_SAY || type == CHAT_MSG_YELL)
             return;
 
         // to gm lang
@@ -254,22 +260,25 @@ public:
 
     bool OnPlayerReputationChange(Player* player, uint32 factionID, int32& standing, bool /*incremental*/) override
     {
-        uint32 repGain = player->GetReputation(factionID);
+        if (!sCFBG->IsEnableSystem())
+            return true;
+
         TeamId teamId = player->GetTeamId(true);
 
         if ((factionID == FACTION_FROSTWOLF_CLAN && teamId == TEAM_ALLIANCE) ||
             (factionID == FACTION_STORMPIKE_GUARD && teamId == TEAM_HORDE))
         {
-            uint32 diff = standing - repGain;
+            // Signed arithmetic: a reputation LOSS must arrive as a negative
+            // delta; an unsigned difference would wrap and slam the mirror
+            // faction to the reputation floor.
+            int32 current = player->GetReputationMgr().GetReputation(sFactionStore.LookupEntry(factionID));
+            int32 diff = standing - current;
             player->GetReputationMgr().ModifyReputation(sFactionStore.LookupEntry(teamId == TEAM_ALLIANCE ? FACTION_STORMPIKE_GUARD : FACTION_FROSTWOLF_CLAN), diff);
             return false;
         }
 
         return true;
     }
-
-private:
-    uint32 timeCheck = 10000;
 };
 
 // WG constants duplicated here to avoid pulling in BattlefieldWG.h
