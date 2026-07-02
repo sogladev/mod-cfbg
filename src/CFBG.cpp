@@ -111,9 +111,7 @@ void CFBG::LoadConfig()
             // Anything left is a leaked entry whose Player was already
             // deleted; drop it without dereferencing the key.
             _fakePlayerStore.clear();
-            _fakeNamePlayersStore.clear();
             _forgetBGPlayersStore.clear();
-            _forgetInListPlayersStore.clear();
         }
 
         return;
