@@ -12,6 +12,7 @@
 #include "Config.h"
 #include "Containers.h"
 #include "Language.h"
+#include "ObjectAccessor.h"
 #include "Opcodes.h"
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
@@ -93,9 +94,30 @@ CFBG* CFBG::instance()
 
 void CFBG::LoadConfig()
 {
+    bool const wasEnabled = _IsEnableSystem;
     _IsEnableSystem = sConfigMgr->GetOption<bool>("CFBG.Enable", false);
     if (!_IsEnableSystem)
+    {
+        // Live-disable via .reload: restore every online faked player and drop
+        // all Player*-keyed state; otherwise they stay cross-faction until
+        // relog and the stale keys can corrupt a later Player reusing the
+        // same address.
+        if (wasEnabled)
+        {
+            for (auto const& [guid, player] : ObjectAccessor::GetPlayers())
+                if (IsPlayerFake(player))
+                    ClearFakePlayer(player);
+
+            // Anything left is a leaked entry whose Player was already
+            // deleted; drop it without dereferencing the key.
+            _fakePlayerStore.clear();
+            _fakeNamePlayersStore.clear();
+            _forgetBGPlayersStore.clear();
+            _forgetInListPlayersStore.clear();
+        }
+
         return;
+    }
 
     _IsEnableWGSystem = sConfigMgr->GetOption<bool>("CFBG.Battlefield.Enable", true);
     _IsEnableWGTeamLock = sConfigMgr->GetOption<bool>("CFBG.Battlefield.TeamLock.Enable", true);
@@ -319,6 +341,11 @@ void CFBG::EnforceBGTeamConsistency(Player* player)
 
     Battleground* bg = player->GetBattleground();
     if (!bg || bg->isArena())
+        return;
+
+    // EndBattleground already restored real identities; re-faking a ghost who
+    // reclaims during WAIT_LEAVE would double-morph him for the rest of the window.
+    if (bg->GetStatus() == STATUS_WAIT_LEAVE)
         return;
 
     TeamId const assigned = player->GetBgTeamId();
@@ -628,19 +655,28 @@ void CFBG::SetWGWarAssignment(ObjectGuid guid, TeamId team)
 
 void CFBG::ClearWGWarAssignments()
 {
+    // A player re-faked at zone entry whose invite was still pending at war
+    // end is in no PlayersInWar set, so the war-end unfake loop misses him;
+    // sweep the assignments so no fake survives the war. Players inside a
+    // battleground are skipped: their fake belongs to the BG lifecycle.
+    for (auto const& [guid, teamId] : _wgWarAssignmentStore)
+        if (Player* player = ObjectAccessor::FindPlayer(guid))
+            if (!player->InBattleground() && IsPlayerFake(player))
+                ClearFakePlayer(player);
+
     _wgWarAssignmentStore.clear();
     _wgCensusValid = false;
     _wgMajorityNativeKept = 0;
 }
 
-TeamId CFBG::ResolveWGWarTeam(Player* player, uint32 nativeAllianceInvited, uint32 nativeHordeInvited)
+TeamId CFBG::ResolveWGWarTeam(Player* player, uint32 nativeAllianceInvited, uint32 nativeHordeInvited, uint32 allianceInWar, uint32 hordeInWar)
 {
     // Capture the native split once: at the first join PlayersInWar is empty
     // and nobody is faked, so the invited counts are the true native census.
     if (!_wgCensusValid)
     {
         _wgMajorityTeam = (nativeAllianceInvited >= nativeHordeInvited) ? TEAM_ALLIANCE : TEAM_HORDE;
-        _wgMajorityFairShare = (nativeAllianceInvited + nativeHordeInvited) / 2;
+        _wgMajorityFairShare = (nativeAllianceInvited + nativeHordeInvited + 1) / 2;
         _wgMajorityNativeKept = 0;
         _wgCensusValid = true;
     }
@@ -659,7 +695,16 @@ TeamId CFBG::ResolveWGWarTeam(Player* player, uint32 nativeAllianceInvited, uint
         return realTeam;
     }
 
-    return (_wgMajorityTeam == TEAM_ALLIANCE) ? TEAM_HORDE : TEAM_ALLIANCE;
+    // Past the fair share: flip only when it does not worsen the live balance —
+    // with a sparse census (e.g. 1/0) and trickle joins, unconditional flips
+    // would stack the entire majority onto the other side.
+    uint32 const ownInWar   = (realTeam == TEAM_ALLIANCE) ? allianceInWar : hordeInWar;
+    uint32 const otherInWar = (realTeam == TEAM_ALLIANCE) ? hordeInWar : allianceInWar;
+    if (ownInWar > otherInWar)
+        return (_wgMajorityTeam == TEAM_ALLIANCE) ? TEAM_HORDE : TEAM_ALLIANCE;
+
+    ++_wgMajorityNativeKept;
+    return realTeam;
 }
 
 void CFBG::FitPlayerInTeam(Player* player, Battleground* bg)
